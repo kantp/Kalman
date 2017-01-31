@@ -75,7 +75,7 @@ initialDist = MultiNormal (vector [1.6, 0.0])
                                          0.0, 0.1])
 
 multiEKF :: [ℝ] -> [MultiNormal (R 2)]
-multiEKF obs = scanl singleEKF initialDist (map (vector . pure) obs)
+multiEKF obs = fst <$> scanl singleEKF (initialDist, 0) (map (vector . pure) obs)
 
 multiUKF :: [ℝ] -> [MultiNormal (R 2)]
 multiUKF obs = scanl singleUKF initialDist (map (vector . pure) obs)

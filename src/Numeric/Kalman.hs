@@ -1,3 +1,5 @@
+{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Numeric.Kalman
@@ -169,7 +171,7 @@
 -- [book](http://www.cambridge.org/gb/academic/subjects/statistics-probability/applied-probability-and-stochastic-networks/bayesian-filtering-and-smoothing),
 -- we can track the pendulum using the extended Kalman filter.
 --
--- > multiEKF obs = scanl singleEKF initialDist (map (vector . pure) obs)
+-- > multiEKF obs = fst <$> scanl singleEKF (initialDist, 0) (map (vector . pure) obs)
 --
 -- And then plot the results.
 --
@@ -281,6 +283,7 @@ module Numeric.Kalman
        )
        where
 
+import Data.Proxy
 import GHC.TypeLits
 import Numeric.LinearAlgebra.Static
 import Data.Maybe ( fromJust )
@@ -344,39 +347,47 @@ runKFPrediction linEvol =
 -- estimated state accordingly.
 --
 -- This step requires the linearized measurement transformation.
-runEKFUpdate
-  :: (KnownNat m, KnownNat n)
-  => (a -> R n -> R m)   -- ^ System measurement function \(\boldsymbol{h}_i\)
-  -> (a -> R n -> L m n) -- ^ Linearization of the observation at a point
-                         -- \(\frac{\partial \boldsymbol{h}_i}{\partial \boldsymbol{x}}\big|_{\boldsymbol{x}}\)
-  -> (a -> Sym m)        -- ^ Covariance matrix encoding measurement noise \(R_i\)
-  -> a                   -- ^ Dynamical input \(\boldsymbol{u}_{i-1}\)
-  -> (R n, Sym n)        -- ^ Current prediction \(({\boldsymbol{x}}_i^\flat, {\boldsymbol{\Sigma}}_i^\flat)\)
-  -> R m                 -- ^ New measurement \(\boldsymbol{y}_i\)
-  -> (R n, Sym n)        -- ^ Updated prediction \((\hat{\boldsymbol{x}}_i, \hat{\boldsymbol{\Sigma}}_i)\)
+--
+-- Also computes the energy function \({\varphi}\), to estimate the
+-- logarithmic likelihood (see chapter 12 in Särkkä's book, and in
+-- particular Theorem 12.3.
+runEKFUpdate :: forall a m n.
+     (KnownNat m, KnownNat n)
+  => (a -> R n -> R m)      -- ^ System measurement function \(\boldsymbol{h}_i\)
+  -> (a -> R n -> L m n)    -- ^ Linearization of the observation at a point
+                            -- \(\frac{\partial \boldsymbol{h}_i}{\partial \boldsymbol{x}}\big|_{\boldsymbol{x}}\)
+  -> (a -> Sym m)           -- ^ Covariance matrix encoding measurement noise \(R_i\)
+  -> a                      -- ^ Dynamical input \(\boldsymbol{u}_{i-1}\)
+  -> ((R n, Sym n), Double) -- ^ Current prediction \((({\boldsymbol{x}}_i^\flat, {\boldsymbol{\Sigma}}_i^\flat), {\varphi}_{i-1})\)
+  -> R m                    -- ^ New measurement \(\boldsymbol{y}_i\)
+  -> ((R n, Sym n), Double) -- ^ Updated prediction \(((\hat{\boldsymbol{x}}_i, \hat{\boldsymbol{\Sigma}}_i), {\varphi}_i)\)
 
-runEKFUpdate measure linMeas measCov input (predMu, predCov') newMeas =
-  (newMu, newCov)
+runEKFUpdate measure linMeas measCov input ((predMu, predCov'), phi) newMeas =
+  ((newMu, newCov), newPhi)
   where
-    newMu  = predMu + kkMat #> voff
-    newCov = sym $ predCov - kkMat <> skMat <> tr kkMat
+    newMu  = predMu + kkMat #> voff -- m_k
+    newCov = sym $ predCov - kkMat <> skMat <> tr kkMat -- P_k
 
     predCov = unSym predCov'
 
     lin   = linMeas input predMu
-    voff  = newMeas - measure input predMu
-    skMat = lin <> predCov <> tr lin + unSym (measCov input)
-    kkMat = predCov <> tr lin <> unsafeInv skMat
+    voff  = newMeas - measure input predMu -- v_k
+    skMat = lin <> predCov <> tr lin + unSym (measCov input) -- S_k
+    kkMat = predCov <> tr lin <> unsafeInv skMat -- K_k
+
+    (skInv :: L m m, (lnDetSk, _lnSign)) = invlndet skMat
+    newPhi = (phi + 0.5 * (fromInteger (natVal (Proxy :: Proxy m))*log (2*pi)
+                           + lnDetSk + voff <.> (skInv #> voff)))
 
 
 runKFUpdate
   :: (KnownNat m, KnownNat n)
-  => (a -> R n -> L m n) -- ^ Linear measurement operator at a point \(\boldsymbol{h}_i\)
-  -> (a -> Sym m)        -- ^ Covariance matrix encoding measurement noise \(R_i\)
-  -> a                   -- ^ Dynamical input \(\boldsymbol{u}_{i-1}\)
-  -> (R n, Sym n)        -- ^ Current prediction \(({\boldsymbol{x}}_i^\flat, {\boldsymbol{\Sigma}}_i^\flat)\)
-  -> R m                 -- ^ New measurement \(\boldsymbol{y}_i\)
-  -> (R n, Sym n)        -- ^ Updated prediction \((\hat{\boldsymbol{x}}_i, \hat{\boldsymbol{\Sigma}}_i)\)
+  => (a -> R n -> L m n)    -- ^ Linear measurement operator at a point \(\boldsymbol{h}_i\)
+  -> (a -> Sym m)           -- ^ Covariance matrix encoding measurement noise \(R_i\)
+  -> a                      -- ^ Dynamical input \(\boldsymbol{u}_{i-1}\)
+  -> ((R n, Sym n), Double) -- ^ Current prediction \((({\boldsymbol{x}}_i^\flat, {\boldsymbol{\Sigma}}_i^\flat), {\varphi}_{i-1})\)
+  -> R m                    -- ^ New measurement \(\boldsymbol{y}_i\)
+  -> ((R n, Sym n), Double) -- ^ Updated prediction \(((\hat{\boldsymbol{x}}_i, \hat{\boldsymbol{\Sigma}}_i), {\varphi}_i)\)
 runKFUpdate linMeas =
   runEKFUpdate (\inp sys -> linMeas inp sys #> sys) linMeas
 
@@ -385,51 +396,51 @@ runKFUpdate linMeas =
 -- filter.
 runEKF
   :: (KnownNat m, KnownNat n)
-  => (a -> R n -> R m)   -- ^ System measurement function \(\boldsymbol{h}_i\)
-  -> (a -> R n -> L m n) -- ^ Linearization of the measurement at a point
-                         -- \(\frac{\partial \boldsymbol{h}_i}{\partial \boldsymbol{x}}\big|_{\boldsymbol{x}}\)
-  -> (a -> Sym m)        -- ^ Covariance matrix encoding measurement noise \(R_i\)
-  -> (a -> R n -> R n)   -- ^ System evolution function
-                         -- \(\boldsymbol{a}_i(\boldsymbol{u}, \boldsymbol{x})\),
-                         -- note the order of the control and the
-                         -- input
-  -> (a -> R n -> Sq n)  -- ^ Linearization of the system evolution at a point  \(\frac{\partial \boldsymbol{a}_i}{\partial \boldsymbol{x}}\big|_{{\boldsymbol{u}}, \, {\boldsymbol{x}}}\)
-  -> (a -> Sym n)        -- ^ Covariance matrix encoding system evolution noise \(Q_i\)
-  -> a                   -- ^ Dynamical input \(\boldsymbol{u}_{i-1}\)
-  -> (R n, Sym n)        -- ^ Current estimate
-                         -- \((\hat{\boldsymbol{x}}_{i-1}, \hat{\boldsymbol{\Sigma}}_{i-1})\)
-  -> R m                 -- ^ New measurement \(\boldsymbol{y}_i\)
-  -> (R n, Sym n)        -- ^ New (filtered) estimate \((\hat{\boldsymbol{x}}_i, \hat{\boldsymbol{\Sigma}}_i)\)
+  => (a -> R n -> R m)      -- ^ System measurement function \(\boldsymbol{h}_i\)
+  -> (a -> R n -> L m n)    -- ^ Linearization of the measurement at a point
+                            -- \(\frac{\partial \boldsymbol{h}_i}{\partial \boldsymbol{x}}\big|_{\boldsymbol{x}}\)
+  -> (a -> Sym m)           -- ^ Covariance matrix encoding measurement noise \(R_i\)
+  -> (a -> R n -> R n)      -- ^ System evolution function
+                            -- \(\boldsymbol{a}_i(\boldsymbol{u}, \boldsymbol{x})\),
+                            -- note the order of the control and the
+                            -- input
+  -> (a -> R n -> Sq n)     -- ^ Linearization of the system evolution at a point  \(\frac{\partial \boldsymbol{a}_i}{\partial \boldsymbol{x}}\big|_{{\boldsymbol{u}}, \, {\boldsymbol{x}}}\)
+  -> (a -> Sym n)           -- ^ Covariance matrix encoding system evolution noise \(Q_i\)
+  -> a                      -- ^ Dynamical input \(\boldsymbol{u}_{i-1}\)
+  -> ((R n, Sym n), Double) -- ^ Current estimate
+                            -- \(((\hat{\boldsymbol{x}}_{i-1}, \hat{\boldsymbol{\Sigma}}_{i-1}), {\varphi}_{i-1})\)
+  -> R m                    -- ^ New measurement \(\boldsymbol{y}_i\)
+  -> ((R n, Sym n), Double) -- ^ New (filtered) estimate \(((\hat{\boldsymbol{x}}_i, \hat{\boldsymbol{\Sigma}}_i), {\varphi}_i)\)
 runEKF measure linMeas measCov
   evolve linEvol sysCov
   input estSys newMeas = updatedEstimate
   where
-    predictedSystem = runEKFPrediction evolve linEvol sysCov input estSys
-    updatedEstimate = runEKFUpdate measure linMeas measCov input predictedSystem newMeas
+    predictedSystem = runEKFPrediction evolve linEvol sysCov input (fst estSys)
+    updatedEstimate = runEKFUpdate measure linMeas measCov input ((, snd estSys) predictedSystem) newMeas
 
 -- | The ordinary Kalman filter is a special case of the extended Kalman
 -- filter, when the state update and measurement transformations are
 -- already linear.
 runKF
   :: (KnownNat m, KnownNat n)
-  => (a -> R n -> L m n) -- ^ Linear measurement operator at a point \(\boldsymbol{h}_i\)
-  -> (a -> Sym m)        -- ^ Covariance matrix encoding measurement noise \(R_i\)
-  -> (a -> R n -> Sq n)  -- ^ Linear system evolution at a point
-                         -- \(\boldsymbol{a}_i(\boldsymbol{u}_{i-1}, \boldsymbol{x}_{i-1})\),
-                         -- note the order of the control and the
-                         -- input
-  -> (a -> Sym n)        -- ^ Covariance matrix encoding system evolution noise \(Q_i\)
-  -> a                   -- ^ Dynamical input \(\boldsymbol{u}_{i-1}\)
-  -> (R n, Sym n)        -- ^ Current estimate
-                         -- \((\hat{\boldsymbol{x}}_{i-1}, \hat{\boldsymbol{\Sigma}}_{i-1})\)
-  -> R m                 -- ^ New measurement \(\boldsymbol{y}_i\)
-  -> (R n, Sym n)        -- ^ New (filtered) estimate \((\hat{\boldsymbol{x}}_i, \hat{\boldsymbol{\Sigma}}_i)\)
+  => (a -> R n -> L m n)    -- ^ Linear measurement operator at a point \(\boldsymbol{h}_i\)
+  -> (a -> Sym m)           -- ^ Covariance matrix encoding measurement noise \(R_i\)
+  -> (a -> R n -> Sq n)     -- ^ Linear system evolution at a point
+                            -- \(\boldsymbol{a}_i(\boldsymbol{u}_{i-1}, \boldsymbol{x}_{i-1})\),
+                            -- note the order of the control and the
+                            -- input
+  -> (a -> Sym n)           -- ^ Covariance matrix encoding system evolution noise \(Q_i\)
+  -> a                      -- ^ Dynamical input \(\boldsymbol{u}_{i-1}\)
+  -> ((R n, Sym n), Double) -- ^ Current estimate
+                            -- \(((\hat{\boldsymbol{x}}_{i-1}, \hat{\boldsymbol{\Sigma}}_{i-1}), {\varphi}_{i-1})\)
+  -> R m                    -- ^ New measurement \(\boldsymbol{y}_i\)
+  -> ((R n, Sym n), Double) -- ^ New (filtered) estimate \(((\hat{\boldsymbol{x}}_i, \hat{\boldsymbol{\Sigma}}_i), {\varphi}_i)\)
 runKF linMeas measCov
   linEvol sysCov
   input estSys newMeas = updatedEstimate
   where
-    predictedSystem = runKFPrediction linEvol sysCov input estSys
-    updatedEstimate = runKFUpdate linMeas measCov input predictedSystem newMeas
+    predictedSystem = runKFPrediction linEvol sysCov input (fst estSys)
+    updatedEstimate = runKFUpdate linMeas measCov input ((, snd estSys) predictedSystem) newMeas
 
 runUKFPrediction
   :: KnownNat n
